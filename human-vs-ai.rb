@@ -77,12 +77,28 @@ COMPLEXITY_MAP = {
   # Docs
   '.md' => 0.3, '.txt' => 0.2, '.rst' => 0.3,
   # Lock files (machine-generated)
-  '.lock' => 0.05
+  '.lock' => 0.05,
+  # Assets / images (exported, not hand-written)
+  '.svg' => 0.05, '.png' => 0.0, '.jpg' => 0.0, '.jpeg' => 0.0,
+  '.gif' => 0.0, '.webp' => 0.0, '.ico' => 0.0, '.woff' => 0.0, '.woff2' => 0.0
 }
 
 # Change type rules: checked in order, first match wins.
 # Multiplier scales human effort — 1.0 = normal, 0.05 = almost free (automated).
 CHANGE_TYPE_RULES = [
+  {
+    label: 'generated',
+    match: ->(path, _loc) {
+      # Build output directories
+      path.match?(%r{\A(dist|build|out|\.next|_next|_site|\.nuxt|public/build|
+                       static/chunks|\.svelte-kit|coverage)/}x) ||
+      # Minified / bundled files
+      path.match?(/\.(min\.js|min\.css|bundle\.js|chunk\.js|map)\z/i) ||
+      # Exported image/vector assets
+      path.match?(/\.(svg|png|jpe?g|gif|webp|ico|woff2?|eot|ttf|otf)\z/i)
+    },
+    multiplier: 0.02
+  },
   {
     label: 'dep-update',
     match: ->(path, _loc) {
