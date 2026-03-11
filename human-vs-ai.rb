@@ -1,0 +1,340 @@
+require 'rugged'
+require 'date'
+require 'set'
+
+def fmt_int(n)
+  n.to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+end
+
+def fmt_money(n)
+  int, dec = format('%.2f', n).split('.')
+  "#{int.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse}.#{dec}"
+end
+
+# --- COLORS ---
+module C
+  RESET  = "\e[0m"
+  BOLD   = "\e[1m"
+  DIM    = "\e[2m"
+  CYAN   = "\e[36m"
+  YELLOW = "\e[33m"
+  GREEN  = "\e[32m"
+  RED    = "\e[31m"
+  WHITE  = "\e[97m"
+
+  def self.complexity_color(v)
+    if v <= 0.6 then DIM
+    elsif v <= 1.2 then WHITE
+    elsif v <= 1.5 then YELLOW
+    else RED
+    end
+  end
+end
+
+# --- CONFIGURATION ---
+REGIONS = {
+  '--us'   => { label: 'US',              rate: 100.0 },
+  '--eu'   => { label: 'Western Europe',  rate: 75.0  },
+  '--east' => { label: 'Eastern Europe',  rate: 45.0  },
+  '--asia' => { label: 'Asia',            rate: 30.0  },
+}.freeze
+
+# rate_mult: applied to region hourly rate
+# loc_mult:  applied to BASE_LOC_PER_HOUR (higher = faster output = fewer hours billed)
+# Net effect: principal costs more per commit because rate_mult > loc_mult
+SENIORITY = {
+  '--junior'    => { label: 'Junior',    rate_mult: 0.6,  loc_mult: 0.7  },
+  '--senior'    => { label: 'Senior',    rate_mult: 1.0,  loc_mult: 1.0  },
+  '--principal' => { label: 'Principal', rate_mult: 1.75, loc_mult: 1.35 },
+}.freeze
+
+BASE_LOC_PER_HOUR = 25.0
+AI_BASE_COST_PER_COMMIT = 0.05
+AI_HUMAN_OVERSIGHT_MINS = 2.0
+
+# 1.0 = Standard (Ruby/Python/Go) | < 1.0 = Fast (CSS/MD) | > 1.0 = Slow (C/C++/Rust)
+COMPLEXITY_MAP = {
+  # Web / scripting
+  '.rb' => 1.0, '.py' => 1.0, '.php' => 0.9, '.sh' => 0.8,
+  # JavaScript / TypeScript
+  '.js' => 1.0, '.jsx' => 1.0, '.ts' => 1.3, '.tsx' => 1.3,
+  # Systems languages
+  '.rs' => 2.2, '.cpp' => 2.0, '.c' => 1.6, '.go' => 1.0,
+  # JVM / mobile
+  '.java' => 1.4, '.kt' => 1.1, '.scala' => 1.6, '.swift' => 1.3, '.cs' => 1.3,
+  # Functional
+  '.ex' => 1.1, '.exs' => 1.1, '.hs' => 2.0,
+  # Query / schema
+  '.sql' => 0.9, '.graphql' => 0.5, '.gql' => 0.5, '.proto' => 0.4,
+  # Markup / templates
+  '.html' => 0.6, '.erb' => 0.7, '.haml' => 0.6, '.slim' => 0.6,
+  # Styles
+  '.css' => 0.5, '.scss' => 0.5, '.sass' => 0.5,
+  # Config / data
+  '.yml' => 0.3, '.yaml' => 0.3, '.toml' => 0.2, '.json' => 0.2, '.xml' => 0.5,
+  # Infra
+  '.tf' => 0.6,
+  # Docs
+  '.md' => 0.3, '.txt' => 0.2, '.rst' => 0.3,
+  # Lock files (machine-generated)
+  '.lock' => 0.05
+}
+
+# Change type rules: checked in order, first match wins.
+# Multiplier scales human effort — 1.0 = normal, 0.05 = almost free (automated).
+CHANGE_TYPE_RULES = [
+  {
+    label: 'dep-update',
+    match: ->(path, _loc) {
+      File.basename(path).match?(/\A(Gemfile\.lock|package-lock\.json|yarn\.lock|Cargo\.lock|
+                                     Pipfile\.lock|composer\.lock|.*\.lock|Gemfile|
+                                     package\.json|Cargo\.toml|go\.mod|go\.sum)\z/x)
+    },
+    multiplier: 0.05
+  },
+  {
+    label: 'test',
+    match: ->(path, _loc) { path.match?(/(_spec\.|_test\.|\.test\.|\.spec\.)/i) },
+    multiplier: 0.6
+  },
+  {
+    label: 'docs',
+    match: ->(path, _loc) { path.match?(/\.(md|txt|rst|adoc)\z/i) },
+    multiplier: 0.3
+  },
+  {
+    label: 'config',
+    match: ->(path, _loc) { path.match?(/\.(yml|yaml|toml|xml|json|lock|tf)\z/i) },
+    multiplier: 0.4
+  },
+  {
+    label: 'std',
+    match: ->(_path, _loc) { true },
+    multiplier: 1.0
+  }
+]
+
+def change_type_for(path)
+  CHANGE_TYPE_RULES.find { |r| r[:match].call(path, nil) }
+end
+
+# Returns { blended_multiplier:, breakdown: { label => pct } }
+def get_change_type_info(diff)
+  loc_by_type = Hash.new(0)
+  total_loc = 0
+
+  diff.each_patch do |patch|
+    loc = patch.stat[0] + patch.stat[1]
+    next if loc == 0
+    rule = change_type_for(patch.delta.new_file[:path])
+    loc_by_type[rule[:label]] += loc
+    total_loc += loc
+  end
+
+  return { blended_multiplier: 1.0, breakdown: { 'std' => 100 } } if total_loc == 0
+
+  weighted_sum = loc_by_type.sum do |label, loc|
+    rule = CHANGE_TYPE_RULES.find { |r| r[:label] == label }
+    rule[:multiplier] * loc
+  end
+
+  breakdown = loc_by_type.transform_values { |loc| (loc * 100.0 / total_loc).round }
+  { blended_multiplier: weighted_sum / total_loc, breakdown: breakdown }
+end
+
+# Returns { blended_multiplier:, by_lang: }
+# Complexity is LOC-weighted across patches (not patch-count-weighted)
+def get_complexity_info(diff)
+  weighted_sum = 0.0
+  total_loc = 0
+  by_lang = Hash.new(0)
+
+  diff.each_patch do |patch|
+    loc = patch.stat[0] + patch.stat[1]
+    next if loc == 0
+    ext = File.extname(patch.delta.new_file[:path])
+    lang = ext.empty? ? '(none)' : ext
+    by_lang[lang] += loc
+    weighted_sum += (COMPLEXITY_MAP[ext] || 1.0) * loc
+    total_loc += loc
+  end
+
+  blended = total_loc > 0 ? weighted_sum / total_loc : 1.0
+  { blended_multiplier: blended, by_lang: by_lang }
+end
+
+def analyze_repo(path, region, seniority, detail)
+  unless Dir.exist?(path) && Dir.exist?(File.join(path, '.git'))
+    puts "Error: '#{path}' is not a valid git repository."
+    exit 1
+  end
+
+  repo = Rugged::Repository.new(path)
+  walker = Rugged::Walker.new(repo)
+  walker.push(repo.head.target)
+
+  stats = { loc: 0, human_cost: 0, ai_cost: 0, merges: 0, commits: 0, first_date: nil, last_date: nil, committers: Set.new }
+
+  hourly_rate  = region[:rate] * seniority[:rate_mult]
+  loc_per_hour = BASE_LOC_PER_HOUR * seniority[:loc_mult]
+
+  if detail
+    puts "\n#{C::BOLD}#{C::CYAN}Analyzing: #{File.expand_path(path)}#{C::RESET}"
+    puts "#{C::DIM}Region:   #{C::RESET}#{C::WHITE}#{region[:label]}#{C::RESET}#{C::DIM} · #{seniority[:label]} ($#{hourly_rate.round}/hr, #{loc_per_hour.round(1)} LOC/hr base)#{C::RESET}"
+    puts C::DIM + ("%-12s | %-11s | %-9s | %-15s | %-13s" % ["Date", "LOC", "Mult", "HC", "AIC"]) + C::RESET
+    puts C::DIM + ("-" * 70) + C::RESET
+  end
+
+  walker.each do |commit|
+    if commit.parents.size > 1
+      stats[:merges] += 1
+      next
+    end
+
+    next if commit.parents.empty?
+    diff = commit.parents.first.diff(commit)
+    _files, additions, deletions = diff.stat
+    delta = additions + (deletions * 0.1)
+    next if delta == 0
+
+    lang_info = get_complexity_info(diff)
+    type_info = get_change_type_info(diff)
+
+    lang_mult = lang_info[:blended_multiplier]
+    type_mult = type_info[:blended_multiplier]
+
+    # Human cost: base rate adjusted for language complexity and change type
+    adjusted_loc_per_hour = loc_per_hour / lang_mult
+    h_cost = (delta / adjusted_loc_per_hour) * hourly_rate * type_mult
+
+    # AI cost: base API cost + complexity-scaled human review, reduced by change type
+    adj_oversight_mins = AI_HUMAN_OVERSIGHT_MINS * lang_mult * type_mult
+    a_cost = AI_BASE_COST_PER_COMMIT + ((adj_oversight_mins / 60.0) * hourly_rate)
+
+    stats[:loc] += additions
+    stats[:human_cost] += h_cost
+    stats[:ai_cost] += a_cost
+    stats[:commits] += 1
+    stats[:last_date]  ||= commit.time
+    stats[:first_date]   = commit.time
+    stats[:committers]  << (commit.author[:email].to_s.downcase)
+
+    if detail
+      cmplx_col = C.complexity_color(lang_mult)
+      puts "#{C::DIM}%-12s#{C::RESET} • #{C::YELLOW}LOC:%-7s#{C::RESET} | #{cmplx_col}Mult:%-4.1f#{C::RESET} | #{C::RED}HC:$%-11s#{C::RESET} | #{C::GREEN}AIC:$%-9s#{C::RESET}" %
+           [commit.time.strftime('%Y-%m-%d'), fmt_int(delta), lang_mult, fmt_money(h_cost), fmt_money(a_cost)]
+
+      lang_parts = lang_info[:by_lang].sort_by { |_, v| -v }.map { |lang, loc| "#{C::DIM}#{lang}: #{loc}#{C::WHITE}" }
+      puts "#{C::WHITE}             ├─ #{lang_parts.join('  ')}#{C::RESET}"
+
+      type_parts = type_info[:breakdown].sort_by { |_, pct| -pct }.map { |label, pct| "#{C::DIM}#{label}: #{pct}%#{C::WHITE}" }
+      puts "#{C::WHITE}             └─ #{type_parts.join('  ')}#{C::RESET}"
+    end
+  end
+
+  render_summary(stats, region, seniority, hourly_rate)
+end
+
+def format_duration(days)
+  if days < 1
+    'less than a day'
+  elsif days < 30
+    "#{days.round(1)} days"
+  elsif days < 365
+    months = days / 30.0
+    "#{months.round(1)} months"
+  else
+    years = days / 365.0
+    "#{years.round(1)} years"
+  end
+end
+
+def table_row(label, value, value_color = C::WHITE)
+  "#{C::DIM}│#{C::RESET} #{C::DIM}%-22s#{C::RESET} #{C::DIM}│#{C::RESET} #{value_color}%-28s#{C::RESET} #{C::DIM}│#{C::RESET}" % [label, value]
+end
+
+def table_divider = "#{C::DIM}├─#{"─" * 23}┼#{"─" * 30}┤#{C::RESET}"
+def table_top     = "#{C::DIM}┌─#{"─" * 23}┬#{"─" * 30}┐#{C::RESET}"
+def table_bottom  = "#{C::DIM}└─#{"─" * 23}┴#{"─" * 30}┘#{C::RESET}"
+
+def table_header(title, subtitle)
+  "#{C::DIM}│#{C::RESET} #{C::BOLD}#{C::CYAN}%-22s#{C::RESET} #{C::DIM}│#{C::RESET} #{C::DIM}%-28s#{C::RESET} #{C::DIM}│#{C::RESET}" % [title, subtitle]
+end
+
+def render_summary(s, region, seniority, hourly_rate)
+  savings = s[:human_cost] > 0 ? ((s[:human_cost] - s[:ai_cost]) / s[:human_cost]) * 100 : 0
+  savings_col = savings >= 0 ? C::GREEN : C::RED
+
+  puts ""
+  puts table_top
+  puts table_header("FINAL ROI ANALYSIS", "#{region[:label]} · #{seniority[:label]} ($#{hourly_rate.round}/hr)")
+  puts table_divider
+  puts table_row("Commits",          "#{fmt_int(s[:commits])}  (+#{fmt_int(s[:merges])} merges skipped)")
+  puts table_row("LOC Added",        fmt_int(s[:loc]),                          C::YELLOW)
+  puts table_row("Human Investment", "$#{fmt_money(s[:human_cost])}",           C::RED)
+  puts table_row("AI Agent Cost",    "$#{fmt_money(s[:ai_cost])}",              C::GREEN)
+  puts table_row("Net AI Savings",   "#{savings.round(1)}%",                    savings_col)
+
+  if s[:first_date] && s[:last_date]
+    actual_days  = [(s[:last_date] - s[:first_date]) / 86400.0, 1].max
+    human_hours  = s[:human_cost] / hourly_rate
+    working_days = human_hours / 8.0
+    team_size    = [s[:committers].size, 1].max
+    team_days    = (working_days / team_size) * (7.0 / 5)
+    speed_mult   = team_days / actual_days
+
+    puts table_divider
+    puts table_header("BUILD SPEED", "#{s[:first_date].strftime('%Y-%m-%d')} → #{s[:last_date].strftime('%Y-%m-%d')}")
+    puts table_divider
+    puts table_row("AI build window",  format_duration(actual_days),                                          C::WHITE)
+    puts table_row("Human equiv",      "#{fmt_int(human_hours.round)} hrs / #{fmt_int(working_days.round)} working days", C::WHITE)
+    puts table_row("Team size",        "#{team_size} committer#{team_size == 1 ? '' : 's'}",                 C::WHITE)
+
+    team_label = team_size == 1 ? "Solo developer" : "#{team_size}-person team"
+    puts table_row(team_label,         format_duration(team_days),                                            C::RED)
+
+    reference_sizes = [1, 3, 5, 10].reject { |n| n == team_size }
+    unless reference_sizes.empty?
+      puts table_divider
+      puts table_header("For reference", "")
+      puts table_divider
+      reference_sizes.each do |devs|
+        calendar_days = (working_days / devs) * (7.0 / 5)
+        label = devs == 1 ? "Solo developer" : "#{devs}-person team"
+        puts table_row(label, format_duration(calendar_days), C::DIM)
+      end
+    end
+
+    puts table_divider
+    puts table_row("AI speed vs team", "#{speed_mult.round(1)}x faster", C::GREEN)
+  end
+
+  puts table_bottom
+end
+
+flags    = ARGV.select { |a| a.start_with?('--') }
+repo_path = ARGV.reject { |a| a.start_with?('--') }.first
+
+region    = REGIONS[flags.find   { |f| REGIONS.key?(f) }]   || REGIONS['--us']
+seniority = SENIORITY[flags.find { |f| SENIORITY.key?(f) }] || SENIORITY['--senior']
+detail    = flags.include?('--detail')
+
+if repo_path.nil?
+  puts "Usage: ruby human-vs-ai.rb <path_to_git_repo> [options]"
+  puts ""
+  puts "  Region (default --us):"
+  puts "    --us    US market rate         ($100/hr)"
+  puts "    --eu    Western Europe          ($75/hr)"
+  puts "    --east  Eastern Europe          ($45/hr)"
+  puts "    --asia  Asia                    ($30/hr)"
+  puts ""
+  puts "  Seniority (default --senior):"
+  puts "    --junior     0.6x rate · 0.7x LOC/hr"
+  puts "    --senior     1.0x rate · 1.0x LOC/hr"
+  puts "    --principal  1.75x rate · 1.35x LOC/hr"
+  puts ""
+  puts "  Output:"
+  puts "    --detail     Show per-commit breakdown (default: summary only)"
+else
+  analyze_repo(repo_path, region, seniority, detail)
+end
