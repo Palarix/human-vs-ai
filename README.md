@@ -6,23 +6,27 @@ A git repository analyzer that estimates what a codebase would have cost to buil
 
 ## Quickstart
 
-**Requirements:** Ruby + the `rugged` gem (`gem install rugged`)
+**Requirements:** Ruby 3.x, Bundler
 
 ```bash
+git clone https://github.com/palarix/human-vs-ai
+cd human-vs-ai
+bundle install
+
 # Summary only — US market, Senior developer (defaults)
-ruby human-vs-ai.rb /path/to/your/repo
+./human-vs-ai /path/to/your/repo
 
 # Full per-commit breakdown
-ruby human-vs-ai.rb /path/to/your/repo --detail
+./human-vs-ai /path/to/your/repo --detail
 
 # Western Europe rates, junior developer, with detail
-ruby human-vs-ai.rb /path/to/your/repo --eu --junior --detail
+./human-vs-ai /path/to/your/repo --eu --junior --detail
 
 # US rates, principal engineer
-ruby human-vs-ai.rb /path/to/your/repo --us --principal
+./human-vs-ai /path/to/your/repo --us --principal
 
 # Asia rates, senior developer
-ruby human-vs-ai.rb /path/to/your/repo --asia --senior
+./human-vs-ai /path/to/your/repo --asia --senior
 ```
 
 Per-commit output (with `--detail`):
