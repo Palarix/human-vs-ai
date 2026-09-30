@@ -1,5 +1,5 @@
-// human-vs-ai estimates what a git repository would have cost to build with a
-// human engineering team versus what it cost to build with AI agents.
+// human-vs-ai estimates the human replacement effort represented by a Git
+// repository and compares it with an explicit AI-assisted cost scenario.
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -78,11 +79,39 @@ var seniorities = map[string]seniority{
 // a*b+c into FMA instructions (arm64, ppc64, s390x), which would change
 // rounding versus other platforms and the original Ruby implementation.
 
-const (
-	baseLOCPerHour       = 25.0
-	aiBaseCostPerCommit  = 0.05
-	aiHumanOversightMins = 2.0
-)
+type estimationConfig struct {
+	baseLOCPerHour float64
+	deletionWeight float64
+}
+
+var estimationProfiles = map[string]estimationConfig{
+	"low":  {40, 0.05},
+	"base": {25, 0.10},
+	"high": {15, 0.20},
+}
+
+type aiTokenModel struct {
+	tokensPerEffortUnit  float64
+	uncachedInputShare   float64
+	cachedInputShare     float64
+	outputShare          float64
+	uncachedInputPerMTok float64
+	cachedInputPerMTok   float64
+	outputPerMTok        float64
+}
+
+// A medium-effort, frontier coding-agent scenario using Sol-level pricing.
+// Token volume includes repository reads, tool output, retries, and reasoning;
+// it is intentionally much larger than the tokens in the final code alone.
+var defaultAITokenModel = aiTokenModel{
+	tokensPerEffortUnit:  2500,
+	uncachedInputShare:   0.30,
+	cachedInputShare:     0.50,
+	outputShare:          0.20,
+	uncachedInputPerMTok: 2.00,
+	cachedInputPerMTok:   0.20,
+	outputPerMTok:        10.00,
+}
 
 // 1.0 = Standard (Ruby/Python/Go) | < 1.0 = Fast (CSS/MD) | > 1.0 = Slow (C/C++/Rust)
 var complexityMap = map[string]float64{
@@ -110,13 +139,13 @@ var complexityMap = map[string]float64{
 	".md": 0.3, ".txt": 0.2, ".rst": 0.3,
 	// Lock files (machine-generated)
 	".lock": 0.05,
-	// Assets / images (exported, not hand-written)
-	".svg": 0.05, ".png": 0.0, ".jpg": 0.0, ".jpeg": 0.0,
+	// Text SVG remains measurable; binary formats contribute no line effort.
+	".svg": 0.3, ".png": 0.0, ".jpg": 0.0, ".jpeg": 0.0,
 	".gif": 0.0, ".webp": 0.0, ".ico": 0.0, ".woff": 0.0, ".woff2": 0.0,
 }
 
 // Change type rules: checked in order, first match wins.
-// Multiplier scales human effort — 1.0 = normal, 0.05 = almost free (automated).
+// Multiplier scales human effort — 1.0 = manual, 0.0 = generated output.
 type changeTypeRule struct {
 	label      string
 	match      func(path string) bool
@@ -125,14 +154,14 @@ type changeTypeRule struct {
 
 var (
 	// Build output directories
-	reBuildDir = regexp.MustCompile(`\A(dist|build|out|\.next|_next|_site|\.nuxt|public/build|static/chunks|\.svelte-kit|coverage)/`)
+	reBuildDir = regexp.MustCompile(`(?:\A|/)(?:dist|build|out|\.next|_next|_site|\.nuxt|public/build|static/chunks|\.svelte-kit|coverage)/`)
 	// Minified / bundled files
 	reBundled = regexp.MustCompile(`(?i)\.(min\.js|min\.css|bundle\.js|chunk\.js|map)\z`)
-	// Exported image/vector assets
-	reAsset = regexp.MustCompile(`(?i)\.(svg|png|jpe?g|gif|webp|ico|woff2?|eot|ttf|otf)\z`)
+	// Exported binary assets
+	reAsset = regexp.MustCompile(`(?i)\.(png|jpe?g|gif|webp|ico|woff2?|eot|ttf|otf)\z`)
 
 	reDepFile = regexp.MustCompile(`\A(Gemfile\.lock|package-lock\.json|yarn\.lock|Cargo\.lock|Pipfile\.lock|composer\.lock|.*\.lock|Gemfile|package\.json|Cargo\.toml|go\.mod|go\.sum)\z`)
-	reTest    = regexp.MustCompile(`(?i)(_spec\.|_test\.|\.test\.|\.spec\.)`)
+	reTest    = regexp.MustCompile(`(?i)(?:\A|/)(?:test|tests|spec|__tests__)/|(_spec\.|_test\.|\.test\.|\.spec\.)`)
 	reDocs    = regexp.MustCompile(`(?i)\.(md|txt|rst|adoc)\z`)
 	reConfig  = regexp.MustCompile(`(?i)\.(yml|yaml|toml|xml|json|lock|tf)\z`)
 )
@@ -143,12 +172,12 @@ var changeTypeRules = []changeTypeRule{
 		match: func(p string) bool {
 			return reBuildDir.MatchString(p) || reBundled.MatchString(p) || reAsset.MatchString(p)
 		},
-		multiplier: 0.02,
+		multiplier: 0.0,
 	},
-	{label: "dep-update", match: func(p string) bool { return reDepFile.MatchString(filepath.Base(p)) }, multiplier: 0.05},
-	{label: "test", match: reTest.MatchString, multiplier: 0.6},
-	{label: "docs", match: reDocs.MatchString, multiplier: 0.3},
-	{label: "config", match: reConfig.MatchString, multiplier: 0.4},
+	{label: "dep-update", match: func(p string) bool { return reDepFile.MatchString(filepath.Base(p)) }, multiplier: 0.1},
+	{label: "test", match: reTest.MatchString, multiplier: 1.0},
+	{label: "docs", match: reDocs.MatchString, multiplier: 1.0},
+	{label: "config", match: reConfig.MatchString, multiplier: 1.0},
 	{label: "std", match: func(string) bool { return true }, multiplier: 1.0},
 }
 
@@ -201,23 +230,27 @@ type changeTypeInfo struct {
 	breakdown         *counter // label => pct
 }
 
-func getChangeTypeInfo(patches []filePatchStat) changeTypeInfo {
-	locByType := newCounter()
+func getChangeTypeInfo(patches []filePatchStat, deletionWeight float64) changeTypeInfo {
+	unitsByType := map[string]float64{}
+	var labels []string
 	multByType := map[string]float64{}
-	totalLOC := 0
+	totalUnits := 0.0
 
 	for _, p := range patches {
-		loc := p.additions + p.deletions
-		if loc == 0 {
+		units := float64(p.additions) + float64(p.deletions)*deletionWeight
+		if units == 0 {
 			continue
 		}
 		rule := changeTypeFor(p.path)
-		locByType.add(rule.label, loc)
+		if _, ok := unitsByType[rule.label]; !ok {
+			labels = append(labels, rule.label)
+		}
+		unitsByType[rule.label] += units
 		multByType[rule.label] = rule.multiplier
-		totalLOC += loc
+		totalUnits += units
 	}
 
-	if totalLOC == 0 {
+	if totalUnits == 0 {
 		b := newCounter()
 		b.add("std", 100)
 		return changeTypeInfo{1.0, b}
@@ -225,12 +258,26 @@ func getChangeTypeInfo(patches []filePatchStat) changeTypeInfo {
 
 	weightedSum := 0.0
 	breakdown := newCounter()
-	for _, label := range locByType.keys {
-		loc := locByType.vals[label]
-		weightedSum += float64(multByType[label] * float64(loc))
-		breakdown.add(label, int(math.Round(float64(loc)*100.0/float64(totalLOC))))
+	type remainder struct {
+		label string
+		frac  float64
 	}
-	return changeTypeInfo{weightedSum / float64(totalLOC), breakdown}
+	var remainders []remainder
+	allocated := 0
+	for _, label := range labels {
+		units := unitsByType[label]
+		weightedSum += multByType[label] * units
+		exact := units * 100 / totalUnits
+		whole := int(math.Floor(exact))
+		breakdown.add(label, whole)
+		allocated += whole
+		remainders = append(remainders, remainder{label, exact - float64(whole)})
+	}
+	sort.SliceStable(remainders, func(i, j int) bool { return remainders[i].frac > remainders[j].frac })
+	for i := 0; i < 100-allocated; i++ {
+		breakdown.vals[remainders[i].label]++
+	}
+	return changeTypeInfo{weightedSum / totalUnits, breakdown}
 }
 
 type complexityInfo struct {
@@ -238,15 +285,15 @@ type complexityInfo struct {
 	byLang            *counter
 }
 
-// Complexity is LOC-weighted across patches (not patch-count-weighted)
-func getComplexityInfo(patches []filePatchStat) complexityInfo {
+// Complexity is effort-delta-weighted across patches (not patch-count-weighted).
+func getComplexityInfo(patches []filePatchStat, deletionWeight float64) complexityInfo {
 	weightedSum := 0.0
-	totalLOC := 0
+	totalUnits := 0.0
 	byLang := newCounter()
 
 	for _, p := range patches {
-		loc := p.additions + p.deletions
-		if loc == 0 {
+		units := float64(p.additions) + float64(p.deletions)*deletionWeight
+		if units == 0 {
 			continue
 		}
 		ext := extname(p.path)
@@ -254,34 +301,38 @@ func getComplexityInfo(patches []filePatchStat) complexityInfo {
 		if ext == "" {
 			lang = "(none)"
 		}
-		byLang.add(lang, loc)
+		byLang.add(lang, int(math.Round(units)))
 		mult, ok := complexityMap[ext]
 		if !ok {
 			mult = 1.0
 		}
-		weightedSum += float64(mult * float64(loc))
-		totalLOC += loc
+		weightedSum += mult * units
+		totalUnits += units
 	}
 
 	blended := 1.0
-	if totalLOC > 0 {
-		blended = weightedSum / float64(totalLOC)
+	if totalUnits > 0 {
+		blended = weightedSum / totalUnits
 	}
 	return complexityInfo{blended, byLang}
 }
 
-// commitPatchStats diffs a commit against its parent without rename
-// detection, matching libgit2's default tree-to-tree diff.
+// commitPatchStats diffs a commit against its parent with rename detection so
+// file moves are not priced as a full deletion plus re-creation.
 func commitPatchStats(parent, commit *object.Commit) ([]filePatchStat, error) {
-	from, err := parent.Tree()
-	if err != nil {
-		return nil, err
+	from := &object.Tree{}
+	var err error
+	if parent != nil {
+		from, err = parent.Tree()
+		if err != nil {
+			return nil, err
+		}
 	}
 	to, err := commit.Tree()
 	if err != nil {
 		return nil, err
 	}
-	changes, err := object.DiffTreeWithOptions(context.Background(), from, to, nil)
+	changes, err := object.DiffTreeWithOptions(context.Background(), from, to, object.DefaultDiffTreeOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -327,17 +378,61 @@ func fileContent(f *object.File) ([]byte, error) {
 }
 
 type repoStats struct {
-	loc        int
-	humanCost  float64
-	aiCost     float64
-	merges     int
-	commits    int
-	firstDate  time.Time
-	lastDate   time.Time
-	committers map[string]struct{}
+	loc          int
+	estimates    map[string]estimateTotals
+	merges       int
+	commits      int
+	firstDate    time.Time
+	lastDate     time.Time
+	activeMonths map[string]struct{}
 }
 
-func analyzeRepo(w io.Writer, path string, reg region, sen seniority, detail bool) error {
+type estimateTotals struct {
+	effortUnits float64
+	humanHours  float64
+	humanCost   float64
+}
+
+type commitEstimate struct {
+	weightedDelta       float64
+	effortUnits         float64
+	effectiveMultiplier float64
+	humanHours          float64
+	humanCost           float64
+}
+
+func estimateCommit(patches []filePatchStat, hourlyRate float64, sen seniority, cfg estimationConfig) commitEstimate {
+	var e commitEstimate
+	for _, p := range patches {
+		delta := float64(p.additions) + float64(p.deletions)*cfg.deletionWeight
+		if delta == 0 {
+			continue
+		}
+		langMult, ok := complexityMap[extname(p.path)]
+		if !ok {
+			langMult = 1
+		}
+		typeMult := changeTypeFor(p.path).multiplier
+		e.weightedDelta += delta
+		e.effortUnits += delta * langMult * typeMult
+	}
+	if e.weightedDelta == 0 {
+		return e
+	}
+	e.effectiveMultiplier = e.effortUnits / e.weightedDelta
+	e.humanHours = e.effortUnits / (cfg.baseLOCPerHour * sen.locMult)
+	e.humanCost = e.humanHours * hourlyRate
+	return e
+}
+
+type analysisOptions struct {
+	profile      string
+	teamSize     int
+	apiCostTotal *float64
+	reviewHours  *float64
+}
+
+func analyzeRepo(w io.Writer, path string, reg region, sen seniority, detail bool, opts analysisOptions) error {
 	repo, err := git.PlainOpen(path)
 	if err != nil {
 		return fmt.Errorf("'%s' is not a valid git repository", path)
@@ -352,18 +447,18 @@ func analyzeRepo(w io.Writer, path string, reg region, sen seniority, detail boo
 	}
 	defer iter.Close()
 
-	stats := repoStats{committers: map[string]struct{}{}}
+	stats := repoStats{estimates: map[string]estimateTotals{}, activeMonths: map[string]struct{}{}}
 
 	hourlyRate := reg.rate * sen.rateMult
-	locPerHour := baseLOCPerHour * sen.locMult
+	selectedCfg := estimationProfiles[opts.profile]
 
 	if detail {
 		abs, _ := filepath.Abs(path)
 		fmt.Fprintf(w, "\n%s%sAnalyzing: %s%s\n", bold, cyan, abs, reset)
 		fmt.Fprintf(w, "%sRegion:   %s%s%s%s%s · %s ($%.0f/hr, %.1f LOC/hr base)%s\n",
-			dim, reset, white, reg.label, reset, dim, sen.label, math.Round(hourlyRate), round1(locPerHour), reset)
-		fmt.Fprintln(w, dim+fmt.Sprintf("%-12s | %-11s | %-9s | %-15s | %-13s", "Date", "LOC", "Mult", "HC", "AIC")+reset)
-		fmt.Fprintln(w, dim+strings.Repeat("-", 70)+reset)
+			dim, reset, white, reg.label, reset, dim, sen.label, math.Round(hourlyRate), round1(selectedCfg.baseLOCPerHour*sen.locMult), reset)
+		fmt.Fprintln(w, dim+fmt.Sprintf("%-12s | %-11s | %-9s | %-15s", "Date", "LOC", "Mult", "HC")+reset)
+		fmt.Fprintln(w, dim+strings.Repeat("-", 54)+reset)
 	}
 
 	err = iter.ForEach(func(commit *object.Commit) error {
@@ -371,12 +466,12 @@ func analyzeRepo(w io.Writer, path string, reg region, sen seniority, detail boo
 			stats.merges++
 			return nil
 		}
-		if commit.NumParents() == 0 {
-			return nil
-		}
-		parent, err := commit.Parent(0)
-		if err != nil {
-			return err
+		var parent *object.Commit
+		if commit.NumParents() == 1 {
+			parent, err = commit.Parent(0)
+			if err != nil {
+				return err
+			}
 		}
 		patches, err := commitPatchStats(parent, commit)
 		if err != nil {
@@ -388,45 +483,42 @@ func analyzeRepo(w io.Writer, path string, reg region, sen seniority, detail boo
 			additions += p.additions
 			deletions += p.deletions
 		}
-		delta := float64(additions) + float64(float64(deletions)*0.1)
-		if delta == 0 {
+		selected := estimateCommit(patches, hourlyRate, sen, selectedCfg)
+		if selected.weightedDelta == 0 {
 			return nil
 		}
 
-		langInfo := getComplexityInfo(patches)
-		typeInfo := getChangeTypeInfo(patches)
+		langInfo := getComplexityInfo(patches, selectedCfg.deletionWeight)
+		typeInfo := getChangeTypeInfo(patches, selectedCfg.deletionWeight)
 
-		langMult := langInfo.blendedMultiplier
-		typeMult := typeInfo.blendedMultiplier
-
-		// Human cost: base rate adjusted for language complexity and change type
-		adjustedLOCPerHour := locPerHour / langMult
-		hCost := (delta / adjustedLOCPerHour) * hourlyRate * typeMult
-
-		// AI cost: base API cost + complexity-scaled human review, reduced by change type
-		adjOversightMins := aiHumanOversightMins * langMult * typeMult
-		aCost := aiBaseCostPerCommit + float64((adjOversightMins/60.0)*hourlyRate)
+		for name, cfg := range estimationProfiles {
+			if name == opts.profile {
+				cfg = selectedCfg
+			}
+			e := estimateCommit(patches, hourlyRate, sen, cfg)
+			t := stats.estimates[name]
+			t.effortUnits += e.effortUnits
+			t.humanHours += e.humanHours
+			t.humanCost += e.humanCost
+			stats.estimates[name] = t
+		}
 
 		when := commit.Committer.When
 		stats.loc += additions
-		stats.humanCost += hCost
-		stats.aiCost += aCost
 		stats.commits++
+		stats.activeMonths[when.Format("2006-01")] = struct{}{}
 		if stats.lastDate.IsZero() || when.After(stats.lastDate) {
 			stats.lastDate = when
 		}
 		if stats.firstDate.IsZero() || when.Before(stats.firstDate) {
 			stats.firstDate = when
 		}
-		stats.committers[strings.ToLower(commit.Author.Email)] = struct{}{}
-
 		if detail {
-			fmt.Fprintf(w, "%s%-12s%s • %sLOC:%-7s%s | %sMult:%-4.1f%s | %sHC:$%-11s%s | %sAIC:$%-9s%s\n",
+			fmt.Fprintf(w, "%s%-12s%s • %sLOC:%-7s%s | %sMult:%-4.1f%s | %sHC:$%-11s%s\n",
 				dim, when.Format("2006-01-02"), reset,
-				yellow, fmtInt(delta), reset,
-				complexityColor(langMult), langMult, reset,
-				red, fmtMoney(hCost), reset,
-				green, fmtMoney(aCost), reset)
+				yellow, fmtInt(math.Round(selected.weightedDelta)), reset,
+				complexityColor(selected.effectiveMultiplier), selected.effectiveMultiplier, reset,
+				red, fmtMoney(selected.humanCost), reset)
 
 			var langParts []string
 			for _, lang := range langInfo.byLang.sortedDesc(func(k string) int { return langInfo.byLang.vals[k] }) {
@@ -447,7 +539,7 @@ func analyzeRepo(w io.Writer, path string, reg region, sen seniority, detail boo
 		return err
 	}
 
-	renderSummary(w, stats, reg, sen, hourlyRate)
+	renderSummary(w, stats, reg, sen, hourlyRate, opts)
 	return nil
 }
 
@@ -516,18 +608,64 @@ var (
 	tableBottom  = dim + "└─" + strings.Repeat("─", 23) + "┴" + strings.Repeat("─", 30) + "┘" + reset
 )
 
-func teamLabel(n int) string {
-	if n == 1 {
-		return "Solo developer"
+func savingsPercent(humanCost, aiCost float64) float64 {
+	if humanCost == 0 {
+		return 0
 	}
-	return fmt.Sprintf("%d-person team", n)
+	return (humanCost - aiCost) / humanCost * 100
 }
 
-func renderSummary(w io.Writer, s repoStats, reg region, sen seniority, hourlyRate float64) {
-	savings := 0.0
-	if s.humanCost > 0 {
-		savings = ((s.humanCost - s.aiCost) / s.humanCost) * 100
+func moneyRange(a, b float64) string {
+	if a > b {
+		a, b = b, a
 	}
+	return "$" + fmtMoney(a) + "–$" + fmtMoney(b)
+}
+
+func humanCostBounds(s repoStats) (minCost, maxCost float64) {
+	minCost, maxCost = math.Inf(1), math.Inf(-1)
+	for _, name := range []string{"low", "base", "high"} {
+		cost := s.estimates[name].humanCost
+		minCost, maxCost = math.Min(minCost, cost), math.Max(maxCost, cost)
+	}
+	return
+}
+
+func estimateAITokens(effortUnits float64, model aiTokenModel) (tokens, cost float64) {
+	tokens = effortUnits * model.tokensPerEffortUnit
+	uncached := tokens * model.uncachedInputShare
+	cached := tokens * model.cachedInputShare
+	output := tokens * model.outputShare
+	cost = uncached/1_000_000*model.uncachedInputPerMTok +
+		cached/1_000_000*model.cachedInputPerMTok +
+		output/1_000_000*model.outputPerMTok
+	return
+}
+
+func fmtTokens(tokens float64) string {
+	if tokens >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", tokens/1_000_000)
+	}
+	if tokens >= 1_000 {
+		return fmt.Sprintf("%.1fK", tokens/1_000)
+	}
+	return fmtInt(tokens)
+}
+
+func renderSummary(w io.Writer, s repoStats, reg region, sen seniority, hourlyRate float64, opts analysisOptions) {
+	selected := s.estimates[opts.profile]
+	tokenCount, toolSpend := estimateAITokens(selected.effortUnits, defaultAITokenModel)
+	toolLabel := "AI cost (estimated)"
+	if opts.apiCostTotal != nil {
+		toolSpend = *opts.apiCostTotal
+		toolLabel = "AI cost (provided)"
+	}
+	operatorCost := 0.0
+	if opts.reviewHours != nil {
+		operatorCost = *opts.reviewHours * hourlyRate
+	}
+	totalAICost := toolSpend + operatorCost
+	savings := savingsPercent(selected.humanCost, totalAICost)
 	savingsCol := green
 	if savings < 0 {
 		savingsCol = red
@@ -537,52 +675,49 @@ func renderSummary(w io.Writer, s repoStats, reg region, sen seniority, hourlyRa
 
 	p("")
 	p(tableTop)
-	p(tableHeader("FINAL ROI ANALYSIS", fmt.Sprintf("%s · %s ($%.0f/hr)", reg.label, sen.label, math.Round(hourlyRate))))
+	p(tableHeader("EFFORT ESTIMATE", fmt.Sprintf("%s · %s · %s", reg.label, sen.label, opts.profile)))
 	p(tableDivider)
 	p(tableRow("Commits", fmt.Sprintf("%s  (+%s merges skipped)", fmtInt(float64(s.commits)), fmtInt(float64(s.merges))), white))
 	p(tableRow("LOC Added", fmtInt(float64(s.loc)), yellow))
-	p(tableRow("Human Investment", "$"+fmtMoney(s.humanCost), red))
-	p(tableRow("AI Agent Cost", "$"+fmtMoney(s.aiCost), green))
-	p(tableRow("Net AI Savings", fmt.Sprintf("%.1f%%", round1(savings)), savingsCol))
+	p(tableRow("Human replacement", "$"+fmtMoney(selected.humanCost), red))
+	p(tableRow("AI scenario", "Sol-level · medium effort", white))
+	p(tableRow("Tokens / weighted LOC", fmtInt(defaultAITokenModel.tokensPerEffortUnit), dim))
+	p(tableRow("AI tokens (estimated)", fmtTokens(tokenCount), white))
+	p(tableRow(toolLabel, "$"+fmtMoney(toolSpend), green))
+	costPerUnit := 0.0
+	if selected.effortUnits > 0 {
+		costPerUnit = toolSpend / selected.effortUnits
+	}
+	p(tableRow("AI cost / weighted LOC", fmt.Sprintf("$%.4f", costPerUnit), dim))
+	if opts.reviewHours == nil {
+		p(tableRow("Operator labor", "not provided", dim))
+		p(tableRow("Tool-cost savings", fmt.Sprintf("%.1f%%", round1(savings)), savingsCol))
+	} else {
+		p(tableRow("Operator cost", "$"+fmtMoney(operatorCost), green))
+		p(tableRow("AI-assisted total", "$"+fmtMoney(totalAICost), green))
+		p(tableRow("Estimated savings", fmt.Sprintf("%.1f%%", round1(savings)), savingsCol))
+	}
+	p(tableDivider)
+	p(tableHeader("HUMAN SENSITIVITY", "low–high assumptions"))
+	p(tableDivider)
+	humanMin, humanMax := humanCostBounds(s)
+	p(tableRow("Human cost range", moneyRange(humanMin, humanMax), dim))
 
 	if s.commits > 0 {
 		actualDays := math.Max(s.lastDate.Sub(s.firstDate).Seconds()/86400.0, 1)
-		humanHours := s.humanCost / hourlyRate
+		humanHours := selected.humanHours
 		workingDays := humanHours / 8.0
-		teamSize := max(len(s.committers), 1)
-		teamDays := (workingDays / float64(teamSize)) * (7.0 / 5)
-		speedMult := teamDays / actualDays
 
 		p(tableDivider)
-		p(tableHeader("BUILD SPEED", s.firstDate.Format("2006-01-02")+" → "+s.lastDate.Format("2006-01-02")))
+		p(tableHeader("EFFORT & SPAN", s.firstDate.Format("2006-01-02")+" → "+s.lastDate.Format("2006-01-02")))
 		p(tableDivider)
-		p(tableRow("AI build window", formatDuration(actualDays), white))
-		p(tableRow("Human equiv", fmt.Sprintf("%s hrs / %s working days", fmtInt(math.Round(humanHours)), fmtInt(math.Round(workingDays))), white))
-		committers := "committers"
-		if teamSize == 1 {
-			committers = "committer"
+		p(tableRow("Repository span", formatDuration(actualDays), white))
+		p(tableRow("Active months", fmt.Sprintf("%d", len(s.activeMonths)), white))
+		p(tableRow("Human equivalent", fmt.Sprintf("%s hrs / %s workdays", fmtInt(math.Round(humanHours)), fmtInt(math.Round(workingDays))), white))
+		if opts.teamSize > 0 {
+			teamDays := (workingDays / float64(opts.teamSize)) * (7.0 / 5)
+			p(tableRow("Team capacity floor", fmt.Sprintf("%d people · %s", opts.teamSize, formatDuration(teamDays)), dim))
 		}
-		p(tableRow("Team size", fmt.Sprintf("%d %s", teamSize, committers), white))
-		p(tableRow(teamLabel(teamSize), formatDuration(teamDays), red))
-
-		var referenceSizes []int
-		for _, n := range []int{1, 3, 5, 10} {
-			if n != teamSize {
-				referenceSizes = append(referenceSizes, n)
-			}
-		}
-		if len(referenceSizes) > 0 {
-			p(tableDivider)
-			p(tableHeader("For reference", ""))
-			p(tableDivider)
-			for _, devs := range referenceSizes {
-				calendarDays := (workingDays / float64(devs)) * (7.0 / 5)
-				p(tableRow(teamLabel(devs), formatDuration(calendarDays), dim))
-			}
-		}
-
-		p(tableDivider)
-		p(tableRow("AI speed vs team", fmt.Sprintf("%.1fx faster", round1(speedMult)), green))
 	}
 
 	p(tableBottom)
@@ -603,48 +738,118 @@ const usage = `Usage: human-vs-ai <path_to_git_repo> [options]
 
   Output:
     --detail     Show per-commit breakdown (default: summary only)
+
+  Estimation:
+    --profile <low|base|high>       Assumption profile (default: base)
+    --team-size <n>                 Show a perfect-parallel capacity floor
+    --ai-cost-total <amount>        Use known subscription/API spend
+    --operator-hours <hours>        Include known human operator time
+
+  General:
     --version    Print version and exit
 `
 
-func main() {
-	var flags []string
-	var repoPath string
-	for _, a := range os.Args[1:] {
-		if strings.HasPrefix(a, "--") {
-			flags = append(flags, a)
-		} else if repoPath == "" {
-			repoPath = a
-		}
+func nextOptionValue(args []string, i *int, name string) (string, error) {
+	if value, ok := strings.CutPrefix(args[*i], name+"="); ok {
+		return value, nil
 	}
+	if *i+1 >= len(args) {
+		return "", fmt.Errorf("%s requires a value", name)
+	}
+	*i++
+	return args[*i], nil
+}
 
+func parseFloatOption(args []string, i *int, name string) (*float64, error) {
+	s, err := nextOptionValue(args, i, name)
+	if err != nil {
+		return nil, err
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return nil, fmt.Errorf("%s must be zero or a positive number", name)
+	}
+	return &v, nil
+}
+
+func main() {
+	var repoPath string
 	reg, sen, detail := regions["--us"], seniorities["--senior"], false
-	regionSet, senioritySet := false, false
-	for _, f := range flags {
+	opts := analysisOptions{profile: "base"}
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
-		case f == "--version":
+		case a == "--version":
 			fmt.Println("human-vs-ai", version)
 			return
-		case f == "--help":
+		case a == "--help" || a == "-h":
 			fmt.Print(usage)
 			return
-		case f == "--detail":
+		case a == "--detail":
 			detail = true
-		}
-		// First matching flag wins.
-		if r, ok := regions[f]; ok && !regionSet {
-			reg, regionSet = r, true
-		}
-		if s, ok := seniorities[f]; ok && !senioritySet {
-			sen, senioritySet = s, true
+		case regions[a].label != "":
+			reg = regions[a]
+		case seniorities[a].label != "":
+			sen = seniorities[a]
+		case a == "--profile" || strings.HasPrefix(a, "--profile="):
+			value, err := nextOptionValue(args, &i, "--profile")
+			if err != nil {
+				fmt.Printf("Error: %s.\n", err)
+				return
+			}
+			if _, ok := estimationProfiles[value]; !ok {
+				fmt.Println("Error: --profile must be low, base, or high.")
+				return
+			}
+			opts.profile = value
+		case a == "--team-size" || strings.HasPrefix(a, "--team-size="):
+			value, err := nextOptionValue(args, &i, "--team-size")
+			n, convErr := strconv.Atoi(value)
+			if err != nil || convErr != nil || n <= 0 {
+				fmt.Println("Error: --team-size must be a positive integer.")
+				return
+			}
+			opts.teamSize = n
+		case a == "--ai-cost-total" || strings.HasPrefix(a, "--ai-cost-total=") || a == "--api-cost-total" || strings.HasPrefix(a, "--api-cost-total="):
+			name := "--ai-cost-total"
+			if strings.HasPrefix(a, "--api-cost-total") {
+				name = "--api-cost-total"
+			}
+			var err error
+			opts.apiCostTotal, err = parseFloatOption(args, &i, name)
+			if err != nil {
+				fmt.Printf("Error: %s.\n", err)
+				return
+			}
+		case a == "--operator-hours" || strings.HasPrefix(a, "--operator-hours=") || a == "--review-hours" || strings.HasPrefix(a, "--review-hours="):
+			name := "--operator-hours"
+			if strings.HasPrefix(a, "--review-hours") {
+				name = "--review-hours"
+			}
+			var err error
+			opts.reviewHours, err = parseFloatOption(args, &i, name)
+			if err != nil {
+				fmt.Printf("Error: %s.\n", err)
+				return
+			}
+		case strings.HasPrefix(a, "-"):
+			fmt.Printf("Error: unknown option %s.\n", a)
+			return
+		case repoPath == "":
+			repoPath = a
+		default:
+			fmt.Printf("Error: unexpected argument %s.\n", a)
+			return
 		}
 	}
 
-	if repoPath == "" || repoPath == "-h" {
+	if repoPath == "" {
 		fmt.Print(usage)
 		return
 	}
 
-	if err := analyzeRepo(os.Stdout, repoPath, reg, sen, detail); err != nil {
+	if err := analyzeRepo(os.Stdout, repoPath, reg, sen, detail, opts); err != nil {
 		fmt.Printf("Error: %s.\n", strings.TrimSuffix(err.Error(), "."))
 		os.Exit(1)
 	}

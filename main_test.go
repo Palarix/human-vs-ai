@@ -1,8 +1,14 @@
 package main
 
 import (
+	"math"
+	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 func TestLineDiffStat(t *testing.T) {
@@ -61,12 +67,14 @@ func TestChangeTypeFor(t *testing.T) {
 	tests := map[string]string{
 		"dist/app.js":              "generated",
 		"assets/app.min.js":        "generated",
-		"images/logo.svg":          "generated",
+		"images/logo.svg":          "std",
+		"packages/app/dist/app.js": "generated",
 		"Gemfile.lock":             "dep-update",
 		"web/package.json":         "dep-update",
 		"go.sum":                   "dep-update",
 		"spec/models/user_spec.rb": "test",
 		"src/app.test.ts":          "test",
+		"tests/helpers.py":         "test",
 		"README.md":                "docs",
 		"config/app.yml":           "config",
 		"infra/main.tf":            "config",
@@ -101,7 +109,7 @@ func TestBlendedMultipliers(t *testing.T) {
 		{path: "README.md", additions: 5},
 		{path: "logo.png"}, // binary: no lines, ignored
 	}
-	lang := getComplexityInfo(patches)
+	lang := getComplexityInfo(patches, 0.1)
 	want := (200*2.2 + 5*0.3) / 205
 	if diff := lang.blendedMultiplier - want; diff > 1e-12 || diff < -1e-12 {
 		t.Errorf("lang mult = %v, want %v", lang.blendedMultiplier, want)
@@ -110,14 +118,142 @@ func TestBlendedMultipliers(t *testing.T) {
 		t.Errorf("byLang keys = %v", got)
 	}
 
-	types := getChangeTypeInfo(patches)
+	types := getChangeTypeInfo(patches, 0.1)
 	if types.breakdown.vals["std"] != 98 || types.breakdown.vals["docs"] != 2 {
 		t.Errorf("breakdown = %v", types.breakdown.vals)
 	}
 
-	empty := getChangeTypeInfo(nil)
+	empty := getChangeTypeInfo(nil, 0.1)
 	if empty.blendedMultiplier != 1.0 || empty.breakdown.vals["std"] != 100 {
 		t.Errorf("empty = %+v", empty)
+	}
+}
+
+func TestEstimateCommitCalculatesPerFile(t *testing.T) {
+	cfg := estimationProfiles["base"]
+	patches := []filePatchStat{
+		{path: "main.rs", additions: 100},
+		{path: "README.md", deletions: 1000},
+	}
+	got := estimateCommit(patches, 100, seniorities["--senior"], cfg)
+	// Rust: 100*2.2. Markdown deletion: 1000*0.1*0.3. Docs are
+	// classified for display but receive no second effort discount.
+	wantUnits := 250.0
+	if math.Abs(got.effortUnits-wantUnits) > 1e-9 {
+		t.Fatalf("effort units = %v, want %v", got.effortUnits, wantUnits)
+	}
+	if math.Abs(got.humanCost-1000) > 1e-9 {
+		t.Errorf("human cost = %v, want 1000", got.humanCost)
+	}
+}
+
+func TestHumanEffortIsInvariantToCommitSplitting(t *testing.T) {
+	cfg := estimationProfiles["base"]
+	sen := seniorities["--senior"]
+	combined := estimateCommit([]filePatchStat{
+		{path: "main.rs", additions: 100},
+		{path: "README.md", additions: 100},
+	}, 100, sen, cfg)
+	rust := estimateCommit([]filePatchStat{{path: "main.rs", additions: 100}}, 100, sen, cfg)
+	docs := estimateCommit([]filePatchStat{{path: "README.md", additions: 100}}, 100, sen, cfg)
+	if math.Abs(combined.humanCost-rust.humanCost-docs.humanCost) > 1e-9 {
+		t.Errorf("combined cost %v != split cost %v", combined.humanCost, rust.humanCost+docs.humanCost)
+	}
+}
+
+func TestChangeTypePercentagesTotal100(t *testing.T) {
+	info := getChangeTypeInfo([]filePatchStat{
+		{path: "main.go", additions: 1},
+		{path: "README.md", additions: 1},
+		{path: "config.yml", additions: 1},
+	}, 0.1)
+	total := 0
+	for _, value := range info.breakdown.vals {
+		total += value
+	}
+	if total != 100 {
+		t.Errorf("percentage total = %d, want 100", total)
+	}
+}
+
+func TestRootCommitIsDiffedAgainstEmptyTree(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/main.go", []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("main.go"); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := wt.Commit("initial", &git.CommitOptions{Author: &object.Signature{
+		Name: "Test", Email: "test@example.com", When: time.Unix(1, 0),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := repo.CommitObject(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patches, err := commitPatchStats(nil, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 1 || patches[0].additions != 3 || patches[0].deletions != 0 {
+		t.Fatalf("root patches = %+v", patches)
+	}
+}
+
+func TestRenameDoesNotCountAsRewrittenContent(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/old.go", []byte("package renamed\n\nfunc Example() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt, _ := repo.Worktree()
+	_, _ = wt.Add("old.go")
+	when := time.Unix(1, 0)
+	sig := &object.Signature{Name: "Test", Email: "test@example.com", When: when}
+	parentHash, err := wt.Commit("initial", &git.CommitOptions{Author: sig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Move("old.go", "new.go"); err != nil {
+		t.Fatal(err)
+	}
+	sig.When = time.Unix(2, 0)
+	commitHash, err := wt.Commit("rename", &git.CommitOptions{Author: sig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, _ := repo.CommitObject(parentHash)
+	commit, _ := repo.CommitObject(commitHash)
+	patches, err := commitPatchStats(parent, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 1 || patches[0].additions != 0 || patches[0].deletions != 0 {
+		t.Fatalf("rename patches = %+v", patches)
+	}
+}
+
+func TestAITokenEstimate(t *testing.T) {
+	tokens, cost := estimateAITokens(100, defaultAITokenModel)
+	if tokens != 250_000 {
+		t.Errorf("tokens = %v, want 250000", tokens)
+	}
+	if math.Abs(cost-0.675) > 1e-9 {
+		t.Errorf("cost = %v, want 0.675", cost)
 	}
 }
 

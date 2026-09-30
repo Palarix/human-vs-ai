@@ -2,7 +2,7 @@
 
 Contributions are welcome. The most useful areas are:
 
-- **Language multipliers** — corrections or additions to `COMPLEXITY_MAP`
+- **Language multipliers** — corrections or additions to `complexityMap`
 - **Change type rules** — new path patterns for generated/build output
 - **Region rates** — new regions or updated market rates
 - **Bug fixes** — incorrect calculations, edge cases, display issues
@@ -12,13 +12,13 @@ Contributions are welcome. The most useful areas are:
 Requires Go 1.25+.
 
 ```bash
-go test ./...
+make check
 ```
 
 ## Running
 
 ```bash
-go run . /path/to/repo --detail
+make run ARGS="/path/to/repo --detail"
 ```
 
 ## Releasing
@@ -28,7 +28,7 @@ Pushing a `v*` tag (e.g. `git tag v1.0.0 && git push origin v1.0.0`) makes GitHu
 ## Guidelines
 
 - Keep the tool dependency-light: pure Go (`CGO_ENABLED=0`), with `go-git` as the only direct dependency
-- Multiplier changes should include a brief rationale in the comment
+- Multiplier and estimation-profile changes should include a rationale and tests
 - Run `gofmt` and `go test ./...` before opening a pull request
 - Open an issue before large refactors
 

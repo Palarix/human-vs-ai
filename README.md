@@ -1,6 +1,6 @@
 # human-vs-ai
 
-A git repository analyzer that estimates what a codebase would have cost to build with a human engineering team, versus what it actually cost to build with AI agents. Useful for quantifying AI ROI on a per-project basis.
+A Git repository analyzer that estimates the human replacement effort for a codebase and compares it with either a transparent frontier-model token estimate or known AI spend. Human operator time is included only when explicitly supplied.
 
 ---
 
@@ -15,6 +15,8 @@ Or build from source with Go 1.25+:
 ```bash
 go install github.com/palarix/human-vs-ai@latest
 ```
+
+From a source checkout, `make build` creates a local static binary and `make check` runs formatting checks, vet, and race-enabled tests.
 
 Then:
 
@@ -33,12 +35,18 @@ human-vs-ai /path/to/your/repo --us --principal
 
 # Asia rates, senior developer
 human-vs-ai /path/to/your/repo --asia --senior
+
+# Conservative/high estimate and a 3-person capacity projection
+human-vs-ai /path/to/your/repo --profile high --team-size 3
+
+# Use known AI spend and operator time instead of relying on cost estimates
+human-vs-ai /path/to/your/repo --ai-cost-total 1200 --operator-hours 80
 ```
 
 Per-commit output (with `--detail`):
 
 ```
-2026-03-10   • LOC:549    | Mult:1.3  | HC:$2,838.51   | AIC:$4.36
+2026-03-10   • LOC:549    | Mult:1.3  | HC:$2,838.51
              ├─ .ts: 768
              └─ std: 98%  test: 2%
 ```
@@ -47,28 +55,27 @@ Summary (always printed):
 
 ```
 ┌─────────────────────────┬────────────────────────────────┐
-│ FINAL ROI ANALYSIS      │ US · Senior ($100/hr)          │
+│ EFFORT ESTIMATE         │ US · Senior · base             │
 ├─────────────────────────┼────────────────────────────────┤
 │ Commits                 │ 48  (+0 merges skipped)        │
 │ LOC Added               │ 16,693                         │
-│ Human Investment        │ $79,067.78                     │
-│ AI Agent Cost           │ $189.41                        │
-│ Net AI Savings          │ 99.8%                          │
+│ Human replacement       │ $79,067.78                     │
+│ AI scenario             │ Sol-level · medium effort      │
+│ Tokens / weighted LOC   │ 2,500                          │
+│ AI tokens (estimated)   │ 49.4M                          │
+│ AI cost (estimated)     │ $133.38                        │
+│ AI cost / weighted LOC  │ $0.0068                        │
+│ Operator labor          │ not provided                   │
+│ Tool-cost savings       │ 99.8%                          │
 ├─────────────────────────┼────────────────────────────────┤
-│ BUILD SPEED             │ 2026-02-20 → 2026-03-11        │
+│ HUMAN SENSITIVITY       │ low–high assumptions           │
 ├─────────────────────────┼────────────────────────────────┤
-│ AI build window         │ 20 days                        │
-│ Human equiv             │ 790 hrs / 99 working days      │
-│ Team size               │ 1 committer                    │
-│ Solo developer          │ 27.7 months                    │
+│ Human cost range        │ $49,000–$132,000               │
 ├─────────────────────────┼────────────────────────────────┤
-│ For reference           │                                │
+│ EFFORT & SPAN           │ 2026-02-20 → 2026-03-11        │
 ├─────────────────────────┼────────────────────────────────┤
-│ 3-person team           │ 9.2 months                     │
-│ 5-person team           │ 5.6 months                     │
-│ 10-person team          │ 2.8 months                     │
-├─────────────────────────┼────────────────────────────────┤
-│ AI speed vs team        │ 41.8x faster                   │
+│ Repository span         │ 20.0 days                      │
+│ Human equivalent        │ 791 hrs / 99 workdays          │
 └─────────────────────────┴────────────────────────────────┘
 ```
 
@@ -107,28 +114,47 @@ Region and seniority flags compose freely. The effective hourly rate is `region_
 | `--detail`  | Show per-commit breakdown before the summary table |
 | `--version` | Print the version and exit                         |
 
+### Estimation
+
+| Option                            | Effect                                                        |
+| --------------------------------- | ------------------------------------------------------------- |
+| `--profile low\|base\|high`       | Select an assumption profile; default is `base`               |
+| `--team-size N`                   | Show a perfect-parallel capacity floor for an explicit team   |
+| `--ai-cost-total AMOUNT`          | Replace estimated model cost with known subscription/API spend |
+| `--operator-hours HOURS`          | Include known human operator time at the selected hourly rate  |
+
+The built-in profiles deliberately vary the most consequential assumptions:
+
+| Profile | Baseline LOC/hr | Deletion weight |
+| ------- | --------------: | --------------: |
+| `low`   | 40              | 0.05            |
+| `base`  | 25              | 0.10            |
+| `high`  | 15              | 0.20            |
+
+“Low” and “high” refer to the resulting cost estimate. They are sensitivity bounds, not confidence intervals.
+
 ---
 
 ## The Math
 
 ### LOC Delta
 
-Only additions count toward the effort signal. Deletions are weighted at `0.1x` — removing code takes some thought, but it is not equivalent to writing new code.
+Additions are the primary effort signal. In the base profile, deletions are weighted at `0.1x`—removing code takes some thought, but it is not equivalent to writing new code. The sensitivity profiles vary this weight.
 
 ```
 delta = additions + (deletions × 0.1)
 ```
 
-Merge commits and empty diffs are skipped entirely.
+Root commits are diffed against an empty tree. Merge commits and empty diffs are skipped. Commits reachable from merged branches are still analyzed, but edits made only while resolving a merge conflict can be omitted.
 
-Line counts come from a **minimal** line diff of each commit against its parent, without rename detection, so they match `git log --numstat --minimal --no-renames` exactly. Binary files (a NUL byte in the first 8000 bytes, the same test git uses) count as zero lines. Plain `git diff` can report somewhat higher numbers on large rewrites, because its default algorithm trades minimality for speed.
+Line counts come from a minimal line diff of each commit against its parent. Rename detection prevents file moves and project-wide renames from being priced as complete rewrites. Binary files (a NUL byte in the first 8000 bytes, the same test Git uses) count as zero lines.
 
 ### Language Complexity Multiplier
 
-Each file extension is assigned a complexity weight reflecting how many lines per hour a developer can realistically produce in that language. The commit-level multiplier is a **LOC-weighted average** across all patches — not a simple patch count average — so a 200-line Rust change dominates over a 5-line markdown edit.
+Each file extension is assigned a complexity weight reflecting how much human effort a line represents relative to the baseline. Unknown extensions use `1.0`.
 
 ```
-lang_mult = Σ(loc_i × complexity_i) / Σ(loc_i)
+file_delta_i = additions_i + (deletions_i × deletion_weight)
 ```
 
 Representative values:
@@ -148,67 +174,64 @@ Representative values:
 
 ### Change Type Multiplier
 
-Within a commit, files are classified by path pattern into change types. The type multiplier is also **LOC-weighted**, so a mixed commit (60% standard, 30% tests, 10% docs) gets a proportionally blended score rather than a binary label.
+Files are also classified by path. Tests, documentation, and configuration remain visible in the breakdown, but they do not receive a second effort discount: their language multiplier already represents their artifact type. Only automated output is discounted.
 
 ```
-type_mult = Σ(loc_i × type_mult_i) / Σ(loc_i)
+file_effort_i = file_delta_i × language_mult_i × type_mult_i
 ```
 
 | Type         | Multiplier | Detection                                         |
 | ------------ | ---------- | ------------------------------------------------- |
-| `dep-update` | 0.05       | Lock files, `package.json`, `go.mod`, etc.        |
-| `docs`       | 0.3        | `.md`, `.txt`, `.rst`, `.adoc`                    |
-| `config`     | 0.4        | `.yml`, `.yaml`, `.toml`, `.json`, `.tf`, etc.    |
-| `test`       | 0.6        | Paths matching `_spec.`, `_test.`, `.test.`, etc. |
+| `generated`  | 0.0        | Build output, minified bundles, maps, binary assets |
+| `dep-update` | 0.1        | Lock files, `package.json`, `go.mod`, etc.        |
+| `docs`       | 1.0        | `.md`, `.txt`, `.rst`, `.adoc`                    |
+| `config`     | 1.0        | `.yml`, `.yaml`, `.toml`, `.json`, `.tf`, etc.    |
+| `test`       | 1.0        | Test filenames and conventional test directories  |
 | `std`        | 1.0        | Everything else                                   |
 
 ### Human Cost per Commit
 
 ```
-effective_loc_per_hour = BASE_LOC_PER_HOUR × seniority_loc_mult / lang_mult
-human_cost = (delta / effective_loc_per_hour) × hourly_rate × type_mult
+effort_units = Σ(file_effort_i)
+human_hours = effort_units / (base_loc_per_hour × seniority_loc_mult)
+human_cost = human_hours × hourly_rate
 ```
 
-`BASE_LOC_PER_HOUR = 25` is calibrated for deliberate, production-quality new code — not typing speed. This is the right baseline for estimating what AI output _would have cost_ a human team to produce, not how fast code can be typed.
+The base profile uses 25 baseline LOC/hour. Because this and the multipliers are assumptions rather than measurements, the summary also reports low-to-high sensitivity results.
 
-### AI Cost per Commit
-
-```
-oversight_mins = AI_HUMAN_OVERSIGHT_MINS × lang_mult × type_mult
-ai_cost = AI_BASE_COST_PER_COMMIT + (oversight_mins / 60) × hourly_rate
-```
-
-AI cost models two components:
-
-- **API cost:** a flat `$0.05` per commit covering token usage
-- **Human oversight:** 2 minutes of engineer review time, scaled by complexity and change type — harder code warrants more careful review
-
-### Build Speed
-
-Human equivalent hours are derived from cost, then projected onto calendar time:
+### AI Token and Cost Estimate
 
 ```
-human_hours  = total_human_cost / hourly_rate
+total_tokens = effort_units × 2,500
+token_mix = 30% uncached input + 50% cached input + 20% output
+model_cost = Σ(tokens_by_type × price_by_type)
+```
+
+The default represents a medium-effort frontier coding-agent workflow, including repository reads, tool results, retries, and reasoning—not merely the tokens visible in generated code. It uses [OpenAI's published GPT-6 Sol rates](https://platform.openai.com/pricing) of `$2.00/M` uncached input tokens, `$0.20/M` cached input tokens, and `$10.00/M` output tokens. These assumptions produce approximately `$0.00675` per weighted LOC.
+
+Token reconstruction from Git is necessarily approximate. `--ai-cost-total` replaces the dollar estimate with known subscription or API spend while retaining the token estimate for reference.
+
+Human operator labor is not guessed. Supply `--operator-hours` to include it; otherwise the output explicitly says that it was not provided and labels the percentage as tool-cost savings rather than total savings.
+
+### Effort and Repository Span
+
+The tool reports human-equivalent effort separately from the elapsed repository span:
+
+```
 working_days = human_hours / 8
-team_size    = unique committer emails in repo history
-calendar_days (team) = (working_days / team_size) × (7/5)
+repository_span = last_analyzed_commit - first_analyzed_commit
 ```
 
-The `7/5` factor converts working days to calendar days accounting for weekends. The primary speed comparison uses the **actual team size** detected from unique committer emails — so a 3-person team is compared against the 3-person human estimate, not a hypothetical solo developer. Reference projections for other team sizes are shown below it.
-
-The speed multiplier is:
-
-```
-speed_mult = calendar_days (actual team) / actual_build_window
-```
+Repository span is not treated as active development time, so the tool does not claim an AI speed multiplier. With `--team-size`, it additionally shows a capacity floor that assumes perfect parallelization and a five-day work week; it is not a delivery forecast.
 
 ---
 
 ## Caveats & Limitations
 
 - **LOC is a proxy, not the truth.** It correlates with effort but ignores architecture, debugging, meetings, and research time.
-- **`BASE_LOC_PER_HOUR = 25` is deliberately conservative.** It reflects the cost of _producing_ the output, not the pace at which a developer types. Studies on production code quality suggest 10–50 net new LOC/day is realistic for complex systems; 25/hr (200/day) is generous.
-- **AI API costs are likely underestimated.** The `$0.05` flat rate does not account for long context windows, retries, failed attempts, or multi-model pipelines. Treat it as a lower bound.
+- **The base rate of 25 baseline LOC/hour is an assumption.** It represents production effort rather than typing speed and should be interpreted alongside the sensitivity range.
+- **AI usage cannot be recovered from Git.** The token model is a transparent scenario, not reconstructed billing. Supply actual AI spend where possible.
 - **Seniority multipliers are opinionated.** The `rate_mult > loc_mult` design for `--principal` reflects the market reality that senior engineers command a premium that outpaces their raw velocity advantage.
 - **The tool only walks the current HEAD.** It does not account for work done on branches that were never merged.
-- **Merge commits are skipped.** Only linear commits with a single parent are analyzed.
+- **Merge commits are skipped.** Reachable branch commits are analyzed, but merge-only conflict-resolution changes may be omitted.
+- **Team projections are capacity floors.** They assume perfect parallelism and ignore coordination costs and indivisible work.
