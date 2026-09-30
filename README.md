@@ -6,27 +6,33 @@ A git repository analyzer that estimates what a codebase would have cost to buil
 
 ## Quickstart
 
-**Requirements:** Ruby 3.x, Bundler
+Download the archive for your platform from the [latest release](https://github.com/palarix/human-vs-ai/releases/latest) (Linux, macOS and Windows on amd64 and arm64), unpack it, and put `human-vs-ai` on your `PATH`. It is a single static binary with no runtime dependencies — not even `git`.
+
+On macOS, a binary downloaded through a browser is quarantined because it isn't signed. Clear that with `xattr -d com.apple.quarantine human-vs-ai`.
+
+Or build from source with Go 1.25+:
 
 ```bash
-git clone https://github.com/palarix/human-vs-ai
-cd human-vs-ai
-bundle install
+go install github.com/palarix/human-vs-ai@latest
+```
 
+Then:
+
+```bash
 # Summary only — US market, Senior developer (defaults)
-./human-vs-ai /path/to/your/repo
+human-vs-ai /path/to/your/repo
 
 # Full per-commit breakdown
-./human-vs-ai /path/to/your/repo --detail
+human-vs-ai /path/to/your/repo --detail
 
 # Western Europe rates, junior developer, with detail
-./human-vs-ai /path/to/your/repo --eu --junior --detail
+human-vs-ai /path/to/your/repo --eu --junior --detail
 
 # US rates, principal engineer
-./human-vs-ai /path/to/your/repo --us --principal
+human-vs-ai /path/to/your/repo --us --principal
 
 # Asia rates, senior developer
-./human-vs-ai /path/to/your/repo --asia --senior
+human-vs-ai /path/to/your/repo --asia --senior
 ```
 
 Per-commit output (with `--detail`):
@@ -96,9 +102,10 @@ Region and seniority flags compose freely. The effective hourly rate is `region_
 
 ### Output `(default: summary only)`
 
-| Flag       | Effect                                             |
-| ---------- | -------------------------------------------------- |
-| `--detail` | Show per-commit breakdown before the summary table |
+| Flag        | Effect                                             |
+| ----------- | -------------------------------------------------- |
+| `--detail`  | Show per-commit breakdown before the summary table |
+| `--version` | Print the version and exit                         |
 
 ---
 
@@ -113,6 +120,8 @@ delta = additions + (deletions × 0.1)
 ```
 
 Merge commits and empty diffs are skipped entirely.
+
+Line counts come from a **minimal** line diff of each commit against its parent, without rename detection, so they match `git log --numstat --minimal --no-renames` exactly. Binary files (a NUL byte in the first 8000 bytes, the same test git uses) count as zero lines. Plain `git diff` can report somewhat higher numbers on large rewrites, because its default algorithm trades minimality for speed.
 
 ### Language Complexity Multiplier
 
@@ -201,5 +210,5 @@ speed_mult = calendar_days (actual team) / actual_build_window
 - **`BASE_LOC_PER_HOUR = 25` is deliberately conservative.** It reflects the cost of _producing_ the output, not the pace at which a developer types. Studies on production code quality suggest 10–50 net new LOC/day is realistic for complex systems; 25/hr (200/day) is generous.
 - **AI API costs are likely underestimated.** The `$0.05` flat rate does not account for long context windows, retries, failed attempts, or multi-model pipelines. Treat it as a lower bound.
 - **Seniority multipliers are opinionated.** The `rate_mult > loc_mult` design for `--principal` reflects the market reality that senior engineers command a premium that outpaces their raw velocity advantage.
-- **The script only walks the default branch HEAD.** It does not account for work done on branches that were never merged.
+- **The tool only walks the current HEAD.** It does not account for work done on branches that were never merged.
 - **Merge commits are skipped.** Only linear commits with a single parent are analyzed.
